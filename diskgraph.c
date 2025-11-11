@@ -30,6 +30,13 @@ static char postscript[256];
 static int resized = 1;
 
 static double period = 0;
+static volatile sig_atomic_t stop_requested = 0;
+
+static void handle_exit_signal( int sig )
+{
+	(void)sig;
+	stop_requested = 1;
+}
 
 
 static void get_terminal_size(void)
@@ -56,6 +63,9 @@ static void set_console_mode()
 
 // History of statistics.
 #define MAXHIST		320
+#define SECTORS_PER_MIB	2048
+#define SMOOTHING_FACTOR	0.7
+
 typedef uint32_t measurement_t[3];
 measurement_t hist[ MAXHIST ];
 uint32_t head = 0;
@@ -106,6 +116,8 @@ static struct termios orig_termios;
 void disableRawMode()
 {
 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+	printf( "\x1b[?25h" );
+	fflush( stdout );
 }
 
 void enableRawMode()
@@ -302,15 +314,18 @@ static void set_postscript(const char* devname)
 {
 	char fname[128];
 	char nm[128];
-	memset(nm, 1, sizeof(nm));
+	memset(nm, 0, sizeof(nm));
 	snprintf( fname, sizeof(fname), "/sys/class/block/%s/device/model", devname );
 	FILE* f = fopen( fname, "rb" );
 
 	if ( f )
 	{
-		const size_t l = fread( nm, 1, sizeof(nm), f );
-		if ( l>0 && l<sizeof(nm) && nm[l-1] < 32 )
+		size_t l = fread( nm, 1, sizeof(nm)-1, f );
+		while ( l>0 && nm[l-1] < 32 )
+		{
 			nm[l-1] = 0;
+			--l;
+		}
 		fclose(f);
 	}
 	else
@@ -323,17 +338,25 @@ static void set_postscript(const char* devname)
 	(
 		postscript,
 		sizeof(postscript),
-
-		SETFG "%d;%d;%dm" SETBG "%d;%d;%dm%s"
-		SETFG "%d;%d;%dm" SETBG "%d;%d;%dm%s"
-		SETFG "%d;%d;%dm" SETBG "%d;%d;%dm%s"
-		SETFG "255;255;255m%s",
-
-		0x00,0xc0,0x00, 0,0,0, "RD ",
-		0xc0,0x00,0x00, 0,0,0, "WR ",
-		0xb0,0x60,0x00, 0,0,0, "INFLIGHT ",
-		nm
+		SETFG "%d;%d;%dm" SETBG "%d;%d;%dm%s",
+		255,255,255, 0,0,0, nm
 	);
+}
+
+
+static void print_footer( double rd_avg, double wr_avg, uint32_t inflight )
+{
+	const int bottom_row = termh > 0 ? termh : 1;
+	printf( "\x1b[%d;1H\x1b[K", bottom_row );
+	printf( SETFG "0;192;0m" SETBG "0;0;0mRD " );
+	printf( SETFG "128;128;128m%.1f MiB/s ", rd_avg );
+	printf( SETFG "192;0;0m" SETBG "0;0;0mWR " );
+	printf( SETFG "128;128;128m%.1f MiB/s ", wr_avg );
+	printf( SETFG "176;96;0m" SETBG "0;0;0mINFLIGHT " );
+	printf( SETFG "128;128;128m%u ops ", inflight );
+	printf( "%s", postscript );
+	printf( RESETALL );
+	printf( "\x1b[%d;%dH", bottom_row, termw > 0 ? termw : 1 );
 }
 
 
@@ -341,6 +364,8 @@ int main( int argc, char* argv[] )
 {
 	if ( system("tty -s 1> /dev/null 2> /dev/null") )
 	{
+		printf( "\x1b[?25h" );
+		fflush( stdout );
 		exit(1);
 	}
 	if ( argc != 2 )
@@ -382,6 +407,8 @@ int main( int argc, char* argv[] )
 
 	enableRawMode();
 
+	printf( "\x1b[?25l" );
+
 	// Listen to changes in terminal size
 	struct sigaction sa;
 	sigemptyset( &sa.sa_mask );
@@ -390,9 +417,27 @@ int main( int argc, char* argv[] )
 	if ( sigaction( SIGWINCH, &sa, 0 ) == -1 )
 		perror( "sigaction" );
 
+	struct sigaction sa_int;
+	sigemptyset( &sa_int.sa_mask );
+	sa_int.sa_flags = 0;
+	sa_int.sa_handler = handle_exit_signal;
+	const int exit_signals[] = { SIGINT, SIGTERM };
+	for ( int i = 0; i < 2; ++i )
+	{
+		if ( sigaction( exit_signals[i], &sa_int, 0 ) == -1 )
+			perror( "sigaction" );
+	}
+
+	stop_requested = 0;
+
 	int done = 0;
+	double rd_avg = 0.0;
+	double wr_avg = 0.0;
+	int avg_initialized = 0;
 	while ( !done )
 	{
+		if ( stop_requested )
+			done = 1;
 		if ( resized )
 		{
 			printf(SETBG "0;0;0m");
@@ -490,7 +535,25 @@ int main( int argc, char* argv[] )
 		printf( CURSORHOME );
 		print_image_double_res( imw, imh, (unsigned char*) im, legend );
 
-		printf( "%s", postscript );
+		const uint32_t last_idx = (tail + MAXHIST - 1) % MAXHIST;
+		const double rd_mib = hist[last_idx][0] / (double)SECTORS_PER_MIB;
+		const double wr_mib = hist[last_idx][1] / (double)SECTORS_PER_MIB;
+		const uint32_t inflight = hist[last_idx][2];
+
+		if ( !avg_initialized )
+		{
+			rd_avg = rd_mib;
+			wr_avg = wr_mib;
+			avg_initialized = 1;
+		}
+		else
+		{
+			const double complement = 1.0 - SMOOTHING_FACTOR;
+			rd_avg = rd_avg * complement + rd_mib * SMOOTHING_FACTOR;
+			wr_avg = wr_avg * complement + wr_mib * SMOOTHING_FACTOR;
+		}
+
+		print_footer( rd_avg, wr_avg, inflight );
 		fflush( stdout );
 
 		const int NS_PER_MS = 1000000;
@@ -502,6 +565,8 @@ int main( int argc, char* argv[] )
 
 	printf( RESETALL );
 	printf( CLEARSCREEN );
+	printf( "\x1b[?25h" );
+	fflush( stdout );
 
 	return 0;
 }
