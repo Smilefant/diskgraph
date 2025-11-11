@@ -404,8 +404,20 @@ int main( int argc, char* argv[] )
 
 		char c;
 		const int numr = read( STDIN_FILENO, &c, 1 );
-		if ( numr == 1 && ( c == 27 || c == 'q' || c == 'Q' ) )
-			done = 1;
+		if ( numr == 1 )
+		{
+			if ( c == 27 )
+			{
+				char seq[16];
+				const ssize_t extra = read( STDIN_FILENO, seq, sizeof(seq) );
+				if ( extra <= 0 )
+					done = 1;
+			}
+			else if ( c == 'q' || c == 'Q' )
+			{
+				done = 1;
+			}
+		}
 
 		int hsz = histsz();
 		int overflow_bw = 0;
